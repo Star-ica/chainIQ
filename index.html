@@ -354,6 +354,9 @@
   .status-paused  { background: rgba(245,158,11,0.12); color: var(--warning); border: 1px solid rgba(245,158,11,0.25); }
   .status-completed{ background: rgba(107,126,153,0.12); color: var(--muted);  border: 1px solid var(--border); }
   .status-cancelled{ background: rgba(239,68,68,0.1);  color: var(--danger);  border: 1px solid rgba(239,68,68,0.2); }
+  .status-pending  { background: rgba(245,158,11,0.12); color: var(--warning); border: 1px solid rgba(245,158,11,0.25); }
+  .status-approved { background: rgba(16,185,129,0.12); color: var(--success); border: 1px solid rgba(16,185,129,0.25); }
+  .status-rejected { background: rgba(239,68,68,0.1);  color: var(--danger);  border: 1px solid rgba(239,68,68,0.2); }
 
   .quest-reward {
     display: flex;
@@ -1162,7 +1165,7 @@
   <section class="hero">
     <div class="hero-eyebrow">
       <span class="hero-eyebrow-dot"></span>
-      Live on BOT Chain · Chain ID 6805
+      Live on BOT Chain · Chain ID 677
     </div>
     <h1 class="hero-headline">
       Quest campaigns,<br><em>fully on-chain.</em>
@@ -1354,7 +1357,7 @@
     <div class="topbar">
       <div class="page-title" id="pageTitle">Explore Quests</div>
       <div class="topbar-right">
-        <span class="chain-badge">BOT Chain · 6805</span>
+        <span class="chain-badge">BOT Chain · 677</span>
         <span style="font-family:var(--mono);font-size:12px;color:var(--muted)" id="balanceLabel"></span>
       </div>
     </div>
@@ -1573,9 +1576,12 @@
   </div>
 </div>
 
+<script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/6.11.1/ethers.umd.min.js"></script>
 <script>
-// ── Contract Config ──────────────────────────────────────────────────────────
-const CONTRACT_ADDRESS = "0xYOUR_CONTRACT_ADDRESS_HERE"; // replace after deploy
+// ── Contract Config (BOT Chain mainnet) ──────────────────────────────────────
+const CONTRACT_ADDRESS = "0x553D93b1302063E489E250CDdEC9CbbDdCEDA9E1";
+const CHAIN_ID = 677;
+const EXPLORER = "https://scan.botchain.ai";
 
 const ABI = [
   "function questCount() view returns (uint256)",
@@ -1585,7 +1591,7 @@ const ABI = [
   "function submissions(uint256) view returns (uint256 id, uint256 questId, address participant, string proofCID, uint8 status, uint256 timestamp)",
   "function getQuestSubmissions(uint256 questId) view returns (uint256[])",
   "function getSubmissionForParticipant(uint256 questId, address participant) view returns (uint256)",
-  "function createQuest(string title, string descriptionCID, uint256 rewardPerWinner, uint256 maxWinners, uint256 deadline) payable",
+  "function createQuest(string title, string descriptionCID, uint256 rewardPerWinner, uint256 maxWinners, uint256 deadline) payable returns (uint256)",
   "function submitProof(uint256 questId, string proofCID)",
   "function reviewSubmission(uint256 submissionId, bool approve)",
   "function togglePause(uint256 questId)",
@@ -1595,126 +1601,157 @@ const ABI = [
   "event SubmissionMade(uint256 indexed submissionId, uint256 indexed questId, address indexed participant, string proofCID)"
 ];
 
-// BOT Chain config
+// BOT Chain mainnet
 const BOT_CHAIN = {
-  chainId: "0x1A95",  // 6805 in hex
-  chainName: "BOT Chain",
+  chainId: "0x2a5",  // 677
+  chainName: "BOT Chain Mainnet",
   nativeCurrency: { name: "BOT", symbol: "BOT", decimals: 18 },
-  rpcUrls: ["https://rpc.botanixlabs.dev"],
-  blockExplorerUrls: ["https://blockscout.botanixlabs.dev"]
+  rpcUrls: ["https://rpc.botchain.ai"],
+  blockExplorerUrls: [EXPLORER]
 };
 
+// Reads always go through our own RPC, so they never wait on the wallet
+const readProvider = new ethers.JsonRpcProvider(BOT_CHAIN.rpcUrls[0], CHAIN_ID, { staticNetwork: ethers.Network.from(CHAIN_ID) });
+const contract = new ethers.Contract(CONTRACT_ADDRESS, ABI, readProvider);
+
 // ── State ────────────────────────────────────────────────────────────────────
-let provider = null;
-let signer = null;
-let contract = null;
 let account = null;
 let allQuests = [];
 let currentFilter = "all";
 let currentQuestId = null;
 let platformFeeBps = 200;
+let txBusy = false;
+let listenersAttached = false;
 
 // ── Wallet ───────────────────────────────────────────────────────────────────
+
+// Rejects instead of hanging forever when the wallet or RPC never answers
+function withTimeout(promise, ms, msg) {
+  return Promise.race([promise, new Promise((_, rej) => setTimeout(() => rej(new Error(msg)), ms))]);
+}
 
 // Called from landing page buttons
 async function connectWalletFromLanding() {
   await connectWallet();
 }
 
-async function connectWallet() {
+async function connectWallet(silent = false) {
   if (!window.ethereum) {
-    // If called from landing, show inline alert
-    alert("No wallet detected. Please install MetaMask or a compatible wallet.");
+    if (!silent) toast("No wallet detected. Install MetaMask or a compatible wallet.", "err");
     return;
   }
-
   try {
-    // Request accounts
-    const accounts = await window.ethereum.request({ method: "eth_requestAccounts" });
-    account = accounts[0];
-
-    // Switch to BOT Chain
-    try {
-      await window.ethereum.request({
-        method: "wallet_switchEthereumChain",
-        params: [{ chainId: BOT_CHAIN.chainId }]
-      });
-    } catch (switchErr) {
-      if (switchErr.code === 4902) {
-        await window.ethereum.request({
-          method: "wallet_addEthereumChain",
-          params: [BOT_CHAIN]
-        });
-      }
-    }
-
-    // Set up ethers
-    if (typeof ethers === "undefined") {
-      await loadEthers();
-    }
-
-    provider = new ethers.BrowserProvider(window.ethereum);
-    signer = await provider.getSigner();
-    contract = new ethers.Contract(CONTRACT_ADDRESS, ABI, signer);
+    const accounts = await withTimeout(
+      window.ethereum.request({ method: silent ? "eth_accounts" : "eth_requestAccounts" }),
+      silent ? 5000 : 60000,
+      "Wallet did not respond. Open MetaMask from the toolbar and clear pending requests."
+    );
+    if (!accounts || !accounts.length) return;
+    account = ethers.getAddress(accounts[0]);
+    attachListeners();
 
     // ── Transition: hide landing, reveal app ──
     document.getElementById("landing").classList.add("hidden");
     document.getElementById("appShell").classList.remove("hidden");
-
-    // Update sidebar wallet button
     document.getElementById("walletDot").classList.add("connected");
     document.getElementById("walletLabel").textContent = shortenAddr(account);
 
-    // Load data
-    await loadPlatformFee();
-    await loadAllQuests();
-    await loadMySubmissions();
-    updateStats();
+    await refreshAll();
 
-    toast("Wallet connected ✓", "ok");
-
-    // Balance
-    const bal = await provider.getBalance(account);
-    document.getElementById("balanceLabel").textContent =
-      parseFloat(ethers.formatEther(bal)).toFixed(4) + " BOT";
-
+    if (!silent) {
+      toast("Wallet connected ✓", "ok");
+      // Ask for the network switch in the background so a hidden prompt can't freeze connect
+      withTimeout(ensureChain(), 60000, "switch")
+        .catch(() => toast("Switch MetaMask to BOT Chain (677) before sending transactions", "err"));
+    }
   } catch (e) {
     console.error(e);
-    toast(e.reason || e.message || "Connection failed", "err");
+    if (!silent) toast(errText(e), "err");
   }
 }
 
-async function loadEthers() {
-  return new Promise((resolve, reject) => {
-    const s = document.createElement("script");
-    s.src = "https://cdnjs.cloudflare.com/ajax/libs/ethers/6.7.1/ethers.umd.min.js";
-    s.onload = resolve;
-    s.onerror = reject;
-    document.head.appendChild(s);
-  });
+async function ensureChain() {
+  const id = parseInt(await window.ethereum.request({ method: "eth_chainId" }), 16);
+  if (id === CHAIN_ID) return;
+  try {
+    await window.ethereum.request({ method: "wallet_switchEthereumChain", params: [{ chainId: BOT_CHAIN.chainId }] });
+  } catch (e) {
+    if (e.code === 4902 || e.code === -32603 || /unrecognized|not been added/i.test(e.message || "")) {
+      await window.ethereum.request({ method: "wallet_addEthereumChain", params: [BOT_CHAIN] });
+    } else throw e;
+  }
+}
+
+function attachListeners() {
+  if (listenersAttached || !window.ethereum.on) return;
+  listenersAttached = true;
+  window.ethereum.on("accountsChanged", () => window.location.reload());
+}
+
+async function refreshAll() {
+  await loadPlatformFee();
+  await loadAllQuests();
+  await updateStats();
+  loadMySubmissions();
+  updateBalance();
+}
+
+async function updateBalance() {
+  if (!account) return;
+  try {
+    const bal = await readProvider.getBalance(account);
+    document.getElementById("balanceLabel").textContent = parseFloat(ethers.formatEther(bal)).toFixed(4) + " BOT";
+  } catch {}
 }
 
 async function loadPlatformFee() {
+  try { platformFeeBps = Number(await contract.platformFeeBps()); } catch {}
+}
+
+// ── Transactions ─────────────────────────────────────────────────────────────
+// Estimates gas on our own RPC (so reverts show a reason), then hands MetaMask
+// a complete transaction so its popup opens straight away.
+async function sendTx(fn, args = [], value = 0n) {
+  if (!account) throw new Error("Connect wallet first");
+  if (txBusy) throw new Error("Another transaction is still pending");
+  txBusy = true;
   try {
-    const bps = await contract.platformFeeBps();
-    platformFeeBps = Number(bps);
-  } catch {}
+    await withTimeout(ensureChain(), 60000, "Approve the switch to BOT Chain in MetaMask");
+    const data = contract.interface.encodeFunctionData(fn, args);
+    let gas;
+    try { gas = await readProvider.estimateGas({ from: account, to: CONTRACT_ADDRESS, data, value }); }
+    catch (e) { throw new Error(cleanRevert(e)); }
+    toast("Confirm in your wallet…");
+    const hash = await window.ethereum.request({
+      method: "eth_sendTransaction",
+      params: [{ from: account, to: CONTRACT_ADDRESS, data, value: ethers.toQuantity(value), gas: ethers.toQuantity(gas * 12n / 10n) }]
+    });
+    toast("Transaction sent, waiting for confirmation…");
+    const receipt = await readProvider.waitForTransaction(hash, 1, 180000);
+    if (!receipt) throw new Error("Not confirmed within 3 minutes. Check " + EXPLORER + "/tx/" + hash);
+    if (receipt.status !== 1) throw new Error("Transaction reverted");
+    updateBalance();
+    return { hash, receipt };
+  } finally {
+    txBusy = false;
+  }
 }
 
 // ── Quests ───────────────────────────────────────────────────────────────────
 async function loadAllQuests() {
-  if (!contract) return;
   try {
-    const count = await contract.questCount();
-    allQuests = [];
-    for (let i = 1; i <= Number(count); i++) {
-      const q = await contract.quests(i);
-      allQuests.push(questFromTuple(q, i));
-    }
+    const count = Number(await contract.questCount());
+    const ids = Array.from({ length: count }, (_, i) => i + 1);
+    const tuples = await Promise.all(ids.map(i => contract.quests(i)));
+    allQuests = tuples.map((q, i) => questFromTuple(q, i + 1));
     renderQuests();
     renderMyQuests();
   } catch (e) {
     console.error(e);
+    document.getElementById("questGrid").innerHTML = `<div class="empty-state" style="grid-column:1/-1">
+      <div class="empty-state-icon">⚠️</div>
+      <div class="empty-state-text">Could not reach BOT Chain: ${escHtml(errText(e))}</div>
+    </div>`;
   }
 }
 
@@ -1750,12 +1787,12 @@ function renderQuests() {
   if (!filtered.length) {
     grid.innerHTML = `<div class="empty-state" style="grid-column:1/-1">
       <div class="empty-state-icon">🗺</div>
-      <div class="empty-state-text">No quests found</div>
+      <div class="empty-state-text">${allQuests.length ? "No quests found" : "No quests yet. Be the first to create one."}</div>
     </div>`;
     return;
   }
 
-  grid.innerHTML = filtered.map(questCard).join("");
+  grid.innerHTML = filtered.slice().reverse().map(questCard).join("");
 }
 
 function renderMyQuests() {
@@ -1771,13 +1808,12 @@ function renderMyQuests() {
     return;
   }
 
-  grid.innerHTML = mine.map(questCard).join("");
+  grid.innerHTML = mine.slice().reverse().map(questCard).join("");
 }
 
 function questCard(q) {
   const pct = q.maxWinners ? Math.round((q.winnersCount / q.maxWinners) * 100) : 0;
-  const reward = parseFloat(ethers.formatEther(q.rewardPerWinner.toString())).toFixed(4);
-  const dl = new Date(q.deadline * 1000);
+  const reward = parseFloat(ethers.formatEther(q.rewardPerWinner)).toFixed(4);
   const expired = Date.now() > q.deadline * 1000;
 
   return `<div class="quest-card" onclick="openQuestDetail(${q.id})">
@@ -1796,21 +1832,17 @@ function questCard(q) {
   </div>`;
 }
 
-function updateStats() {
+async function updateStats() {
   document.getElementById("statTotal").textContent = allQuests.length;
-  document.getElementById("statActive").textContent = allQuests.filter(q => q.status === "Active").length;
+  document.getElementById("statActive").textContent =
+    allQuests.filter(q => q.status === "Active" && Date.now() <= q.deadline * 1000).length;
 
-  let totalRewarded = BigInt(0);
-  let totalSubs = 0;
-
-  allQuests.forEach(q => {
-    totalRewarded += BigInt(q.rewardPerWinner.toString()) * BigInt(q.winnersCount);
-    totalSubs += q.winnersCount; // approximation
-  });
-
+  let totalRewarded = 0n;
+  allQuests.forEach(q => { totalRewarded += q.rewardPerWinner * BigInt(q.winnersCount); });
   document.getElementById("statRewarded").textContent =
-    parseFloat(ethers.formatEther(totalRewarded.toString())).toFixed(2) + " BOT";
-  document.getElementById("statParticipants").textContent = totalSubs;
+    parseFloat(ethers.formatEther(totalRewarded)).toFixed(2) + " BOT";
+
+  try { document.getElementById("statParticipants").textContent = Number(await contract.submissionCount()); } catch {}
 }
 
 // ── Quest Detail ─────────────────────────────────────────────────────────────
@@ -1821,16 +1853,18 @@ async function openQuestDetail(questId) {
   const q = allQuests.find(x => x.id === questId);
   if (!q) return;
 
-  const reward = parseFloat(ethers.formatEther(q.rewardPerWinner.toString())).toFixed(4);
+  const reward = parseFloat(ethers.formatEther(q.rewardPerWinner)).toFixed(4);
   const isCreator = account && q.creator.toLowerCase() === account.toLowerCase();
   const pct = q.maxWinners ? Math.round((q.winnersCount / q.maxWinners) * 100) : 0;
+  const expired = Date.now() > q.deadline * 1000;
 
   document.getElementById("detailHeader").innerHTML = `
     <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:8px">
       <div class="detail-title">${escHtml(q.title)}</div>
       <span class="status-pill status-${q.status.toLowerCase()}">${q.status}</span>
     </div>
-    <div class="detail-creator">Creator: ${shortenAddr(q.creator)}</div>
+    <div class="detail-creator">Creator: <a href="${EXPLORER}/address/${q.creator}" target="_blank" rel="noopener" style="color:inherit">${shortenAddr(q.creator)}</a></div>
+    ${q.descriptionCID && q.descriptionCID !== "ipfs://" ? `<div style="font-size:14px;color:var(--muted);margin-bottom:20px;white-space:pre-wrap">${escHtml(q.descriptionCID)}</div>` : ""}
     <div class="detail-reward-block">
       <div>
         <div class="detail-reward-num">${reward} BOT</div>
@@ -1857,59 +1891,63 @@ async function openQuestDetail(questId) {
     <div style="font-size:11px;font-family:var(--mono);color:var(--muted);margin-top:6px">${pct}% filled</div>
   `;
 
-  // Show/hide submit form
-  const submitCard = document.getElementById("submitProofCard");
-  submitCard.style.display = (!isCreator && q.status === "Active") ? "block" : "none";
+  // Only show the submit form when the contract would actually accept a submission
+  let alreadySubmitted = false;
+  if (account && !isCreator) {
+    try { alreadySubmitted = Number(await contract.getSubmissionForParticipant(questId, account)) > 0; } catch {}
+  }
+  const canSubmit = !isCreator && q.status === "Active" && !expired && q.winnersCount < q.maxWinners && !alreadySubmitted;
+  document.getElementById("submitProofCard").style.display = canSubmit ? "block" : "none";
 
   // Creator panel
   document.getElementById("creatorPanel").style.display = isCreator ? "block" : "none";
   document.getElementById("actionColHead").textContent = isCreator ? "Action" : "";
 
-  // Load submissions
   await loadDetailSubmissions(questId, isCreator);
 }
 
 async function loadDetailSubmissions(questId, isCreator) {
   const tbody = document.getElementById("detailSubmissionsBody");
-  if (!contract) return;
-
   try {
-    const subIds = await contract.getQuestSubmissions(questId);
+    const subIds = Array.from(await contract.getQuestSubmissions(questId));
     if (!subIds.length) {
       tbody.innerHTML = `<tr><td colspan="5" style="text-align:center;color:var(--muted);padding:40px">No submissions yet</td></tr>`;
       return;
     }
 
     const statusMap = ["Pending","Approved","Rejected"];
-    const rows = [];
+    const subs = await Promise.all(subIds.map(sid => contract.submissions(sid)));
 
-    for (const sid of subIds) {
-      const s = await contract.submissions(sid);
+    tbody.innerHTML = subs.map((s, i) => {
+      const sid = Number(subIds[i]);
       const statusStr = statusMap[Number(s.status)];
       const time = new Date(Number(s.timestamp) * 1000).toLocaleString();
-
-      let actionCell = "";
-      if (isCreator && statusStr === "Pending") {
-        actionCell = `
-          <button class="btn btn-success btn-sm" onclick="reviewSub(${sid}, true)">✓ Approve</button>
-          <button class="btn btn-danger btn-sm" style="margin-left:6px" onclick="reviewSub(${sid}, false)">✕ Reject</button>
-        `;
-      }
-
-      rows.push(`<tr>
+      const actionCell = (isCreator && statusStr === "Pending") ? `
+        <button class="btn btn-success btn-sm" onclick="reviewSub(${sid}, true)">✓ Approve</button>
+        <button class="btn btn-danger btn-sm" style="margin-left:6px" onclick="reviewSub(${sid}, false)">✕ Reject</button>` : "";
+      return `<tr>
         <td><span class="addr">${shortenAddr(s.participant)}</span></td>
-        <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;font-family:var(--mono)">${escHtml(s.proofCID)}</td>
+        <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;font-family:var(--mono)" title="${escHtml(s.proofCID)}">${proofCell(s.proofCID)}</td>
         <td><span class="status-pill status-${statusStr.toLowerCase()}">${statusStr}</span></td>
         <td style="font-size:11px;color:var(--muted)">${time}</td>
         <td>${actionCell}</td>
-      </tr>`);
-    }
-
-    tbody.innerHTML = rows.join("");
+      </tr>`;
+    }).join("");
   } catch (e) {
     console.error(e);
     tbody.innerHTML = `<tr><td colspan="5" style="text-align:center;color:var(--danger);padding:40px">Failed to load submissions</td></tr>`;
   }
+}
+
+// Proof links are clickable only when they are plain http(s) URLs
+function proofCell(p) {
+  try {
+    const u = new URL(p);
+    if (u.protocol === "https:" || u.protocol === "http:") {
+      return `<a href="${escHtml(u.href)}" target="_blank" rel="noopener" style="color:var(--accent)">${escHtml(p)}</a>`;
+    }
+  } catch {}
+  return escHtml(p);
 }
 
 // ── Create Quest ─────────────────────────────────────────────────────────────
@@ -1929,6 +1967,7 @@ function updateCostSummary() {
   const fee = (pool * platformFeeBps) / 10000;
   const total = pool + fee;
 
+  document.getElementById("feeAmt").previousElementSibling.textContent = `Platform fee (${platformFeeBps / 100}%)`;
   document.getElementById("poolAmt").textContent = pool.toFixed(4) + " BOT";
   document.getElementById("feeAmt").textContent = fee.toFixed(4) + " BOT";
   document.getElementById("totalAmt").textContent = total.toFixed(4) + " BOT";
@@ -1936,12 +1975,12 @@ function updateCostSummary() {
 }
 
 async function createQuest() {
-  if (!contract) return toast("Connect wallet first", "err");
+  if (!account) return toast("Connect wallet first", "err");
 
   const title = document.getElementById("cTitle").value.trim();
   const desc = document.getElementById("cDesc").value.trim();
-  const reward = document.getElementById("cReward").value;
-  const max = document.getElementById("cMax").value;
+  const reward = document.getElementById("cReward").value.trim();
+  const max = document.getElementById("cMax").value.trim();
   const deadline = document.getElementById("cDeadline").value;
 
   if (!title || !reward || !max || !deadline) return toast("Fill all fields", "err");
@@ -1949,32 +1988,35 @@ async function createQuest() {
   const deadlineTs = Math.floor(new Date(deadline).getTime() / 1000);
   if (deadlineTs <= Math.floor(Date.now() / 1000)) return toast("Deadline must be in the future", "err");
 
-  const rewardWei = ethers.parseEther(reward);
   const maxN = parseInt(max);
-  const pool = rewardWei * BigInt(maxN);
-  const fee = (pool * BigInt(platformFeeBps)) / BigInt(10000);
-  const total = pool + fee;
+  if (!Number.isInteger(maxN) || maxN < 1) return toast("Max winners must be a whole number above 0", "err");
 
   const btn = document.getElementById("createBtn");
   btn.disabled = true;
   btn.textContent = "Creating…";
 
   try {
-    const tx = await contract.createQuest(title, desc || "ipfs://", rewardWei, maxN, deadlineTs, {
-      value: total
-    });
-    toast("Transaction sent, waiting…");
-    await tx.wait();
+    const rewardWei = ethers.parseEther(reward);
+    if (rewardWei <= 0n) throw new Error("Reward must be greater than 0");
+    await loadPlatformFee(); // fee is read live from the contract
+    const pool = rewardWei * BigInt(maxN);
+    const fee = (pool * BigInt(platformFeeBps)) / 10000n;
+    const total = pool + fee;
+
+    const bal = await readProvider.getBalance(account);
+    if (bal < total) throw new Error(`Not enough BOT: need ${ethers.formatEther(total)} BOT plus gas`);
+
+    await sendTx("createQuest", [title, desc || "ipfs://", rewardWei, maxN, deadlineTs], total);
     toast("Quest created! 🎉", "ok");
-    // Reset form
     ["cTitle","cDesc","cReward","cMax","cDeadline"].forEach(id => {
       document.getElementById(id).value = "";
     });
     document.getElementById("createSummary").style.display = "none";
     await loadAllQuests();
+    await updateStats();
     showPage("my-quests");
   } catch (e) {
-    toast(e.reason || e.message || "Transaction failed", "err");
+    toast(errText(e), "err");
   } finally {
     btn.disabled = false;
     btn.textContent = "Create Quest";
@@ -1983,7 +2025,7 @@ async function createQuest() {
 
 // ── Submit Proof ─────────────────────────────────────────────────────────────
 async function submitProof() {
-  if (!contract) return toast("Connect wallet first", "err");
+  if (!account) return toast("Connect wallet first", "err");
   const proof = document.getElementById("proofInput").value.trim();
   if (!proof) return toast("Enter your proof", "err");
   if (!currentQuestId) return toast("No quest selected", "err");
@@ -1993,14 +2035,13 @@ async function submitProof() {
   btn.textContent = "Submitting…";
 
   try {
-    const tx = await contract.submitProof(currentQuestId, proof);
-    toast("Transaction sent…");
-    await tx.wait();
+    await sendTx("submitProof", [currentQuestId, proof]);
     toast("Proof submitted! ✓", "ok");
     document.getElementById("proofInput").value = "";
+    await updateStats();
     await openQuestDetail(currentQuestId);
   } catch (e) {
-    toast(e.reason || e.message || "Failed", "err");
+    toast(errText(e), "err");
   } finally {
     btn.disabled = false;
     btn.textContent = "Submit Proof";
@@ -2009,75 +2050,73 @@ async function submitProof() {
 
 // ── Review ───────────────────────────────────────────────────────────────────
 async function reviewSub(submissionId, approve) {
-  if (!contract) return;
+  if (approve && !confirm("Approve this submission? The reward is sent to the participant immediately.")) return;
   try {
-    const tx = await contract.reviewSubmission(submissionId, approve);
-    toast("Processing…");
-    await tx.wait();
+    await sendTx("reviewSubmission", [submissionId, approve]);
     toast(approve ? "Approved & reward sent ✓" : "Rejected", approve ? "ok" : "err");
-    await openQuestDetail(currentQuestId);
     await loadAllQuests();
+    await updateStats();
+    await openQuestDetail(currentQuestId);
   } catch (e) {
-    toast(e.reason || e.message || "Failed", "err");
+    toast(errText(e), "err");
   }
 }
 
 // ── Creator controls ─────────────────────────────────────────────────────────
 async function togglePause() {
-  if (!contract || !currentQuestId) return;
+  if (!currentQuestId) return;
   try {
-    const tx = await contract.togglePause(currentQuestId);
-    await tx.wait();
+    await sendTx("togglePause", [currentQuestId]);
     toast("Quest status updated", "ok");
     await loadAllQuests();
     await openQuestDetail(currentQuestId);
-  } catch (e) { toast(e.reason || e.message || "Failed", "err"); }
+  } catch (e) { toast(errText(e), "err"); }
 }
 
 async function cancelQuest() {
-  if (!contract || !currentQuestId) return;
-  if (!confirm("Cancel this quest and refund remaining pool?")) return;
+  if (!currentQuestId) return;
+  if (!confirm("Cancel this quest and refund the remaining pool? The platform fee is not refunded.")) return;
   try {
-    const tx = await contract.cancelQuest(currentQuestId);
-    await tx.wait();
+    await sendTx("cancelQuest", [currentQuestId]);
     toast("Quest cancelled, pool refunded", "ok");
     await loadAllQuests();
+    await updateStats();
     showPage("my-quests");
-  } catch (e) { toast(e.reason || e.message || "Failed", "err"); }
+  } catch (e) { toast(errText(e), "err"); }
 }
 
 async function reclaimPool() {
-  if (!contract || !currentQuestId) return;
+  if (!currentQuestId) return;
   try {
-    const tx = await contract.reclaimExpiredPool(currentQuestId);
-    await tx.wait();
+    await sendTx("reclaimExpiredPool", [currentQuestId]);
     toast("Remaining pool reclaimed ✓", "ok");
     await loadAllQuests();
     await openQuestDetail(currentQuestId);
-  } catch (e) { toast(e.reason || e.message || "Failed", "err"); }
+  } catch (e) { toast(errText(e), "err"); }
 }
 
 // ── My Submissions ───────────────────────────────────────────────────────────
 async function loadMySubmissions() {
-  if (!contract || !account) return;
+  if (!account) return;
   const tbody = document.getElementById("submissionsBody");
   const statusMap = ["Pending","Approved","Rejected"];
-  const rows = [];
 
   try {
-    const count = await contract.submissionCount();
-    for (let i = 1; i <= Number(count); i++) {
-      const s = await contract.submissions(i);
-      if (s.participant.toLowerCase() !== account.toLowerCase()) continue;
+    // One lookup per quest instead of scanning every submission on the platform
+    const ids = await Promise.all(allQuests.map(q => contract.getSubmissionForParticipant(q.id, account)));
+    const mineIds = ids.map(Number).filter(n => n > 0);
+    const subs = await Promise.all(mineIds.map(id => contract.submissions(id)));
+
+    const rows = subs.reverse().map(s => {
       const q = allQuests.find(x => x.id === Number(s.questId));
       const statusStr = statusMap[Number(s.status)];
-      rows.push(`<tr>
-        <td>${q ? escHtml(q.title) : "#" + s.questId}</td>
-        <td style="font-size:11px;font-family:var(--mono);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(s.proofCID)}</td>
+      return `<tr>
+        <td><a style="color:var(--accent);cursor:pointer" onclick="openQuestDetail(${Number(s.questId)})">${q ? escHtml(q.title) : "#" + s.questId}</a></td>
+        <td style="font-size:11px;font-family:var(--mono);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHtml(s.proofCID)}">${proofCell(s.proofCID)}</td>
         <td><span class="status-pill status-${statusStr.toLowerCase()}">${statusStr}</span></td>
         <td style="font-size:11px;color:var(--muted)">${new Date(Number(s.timestamp)*1000).toLocaleDateString()}</td>
-      </tr>`);
-    }
+      </tr>`;
+    });
 
     tbody.innerHTML = rows.length ? rows.join("") :
       `<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:40px">No submissions yet</td></tr>`;
@@ -2108,6 +2147,7 @@ function showPage(id) {
 
   if (id === "submissions" && account) loadMySubmissions();
   if (id === "my-quests") renderMyQuests();
+  if (id === "create") updateCostSummary();
 }
 
 // ── Utils ─────────────────────────────────────────────────────────────────────
@@ -2116,7 +2156,18 @@ function shortenAddr(addr) {
 }
 
 function escHtml(s) {
-  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+  return String(s ?? "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;");
+}
+
+function errText(e) {
+  return (e && (e.shortMessage || e.reason || e.info?.error?.message || e.data?.message || e.message)) || String(e);
+}
+
+// Pulls the contract's require() message out of an estimateGas error
+function cleanRevert(e) {
+  const m = errText(e);
+  const r = m.match(/reverted(?: with reason string)?:?\s*"?([^"\n]+)"?/i);
+  return r ? r[1].trim() : m;
 }
 
 function timeLeft(deadline) {
@@ -2135,17 +2186,19 @@ function toast(msg, type = "") {
   el.textContent = msg;
   el.className = "show " + type;
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.className = "", 3200);
+  toastTimer = setTimeout(() => el.className = "", type === "err" ? 6000 : 3200);
 }
 
 function closeModal() {
   document.getElementById("proofModal").classList.remove("open");
 }
 
-// Auto-load ethers on page load, then wait for user to connect
-(async () => {
-  try { await loadEthers(); } catch {}
-})();
+// Deadline picker can't go into the past
+const dl = document.getElementById("cDeadline");
+if (dl) dl.min = new Date(Date.now() + 3600000).toISOString().slice(0, 16);
+
+// Reconnect silently if this site is already approved in the wallet
+if (window.ethereum) connectWallet(true);
 </script>
 </body>
 </html>
